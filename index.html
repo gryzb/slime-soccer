@@ -1,0 +1,1587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge">
+  <title>Slime Soccer</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?59"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: #000;
+      touch-action: none;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    #gameCanvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <script>
+  'use strict';
+
+  // ============================================================
+  // SECTION 1: CONSTANTS & CONFIGURATION
+  // ============================================================
+  const CONFIG = {
+    DESIGN_WIDTH: 800,
+    DESIGN_HEIGHT: 500,
+    GROUND_Y: 420,
+
+    // Physics
+    GRAVITY: 0.45,
+    BALL_BOUNCE: 0.65,
+    SLIME_BOUNCE: 1.05,
+    MAX_BALL_SPEED: 14,
+    BALL_RADIUS: 14,
+    SLIME_RADIUS: 45,
+
+    // Movement
+    SLIME_SPEED: 5,
+    SLIME_JUMP_VEL: -11,
+    GROUND_FRICTION: 0.82,
+    AIR_FRICTION: 0.97,
+
+    // Goals
+    GOAL_POST_W: 8,
+    GOAL_HEIGHT: 120,
+    GOAL_DEPTH: 55,
+    NET_SPACING: 15,
+
+    // Grab
+    GRAB_RANGE: 8,
+    GRAB_THROW_SPEED: 13,
+    GRAB_MAX_HOLD: 90,
+
+    // Anti-camping
+    CAMP_WARN_FRAMES: 180,
+    CAMP_PENALTY_FRAMES: 300,
+    CAMP_ZONE_W: 75,
+
+    // Match
+    DURATIONS: [1, 2, 3, 5, 8],
+    CELEBRATION_FRAMES: 120,
+
+    // Colors
+    COL_SKY_TOP: '#1a5276',
+    COL_SKY_BOT: '#2e86c1',
+    COL_GROUND: '#616a6b',
+    COL_GROUND_LINE: '#4d5656',
+    COL_GROUND_BOTTOM: '#515a5a',
+    COL_P1: '#00e5ff',
+    COL_P2: '#ff1744',
+    COL_BALL: '#fdd835',
+    COL_BALL_LINE: '#fff9c4',
+    COL_POST: '#ecf0f1',
+    COL_NET: 'rgba(255,255,255,0.25)',
+    COL_TEXT: '#ffffff',
+    COL_WARN: '#ff6f00',
+    COL_MENU_BG: '#0d1b2a',
+    COL_MENU_BTN: '#1b2838',
+    COL_MENU_BTN_HOVER: '#2e4057',
+    COL_MENU_ACCENT: '#00e5ff',
+
+    // Particles
+    GOAL_PARTICLES: 35,
+    HIT_PARTICLES: 6,
+
+    // AI
+    AI_REACT_DELAY: 6,
+    AI_ACCURACY: 0.88,
+    AI_JUMP_THRESH: 50,
+  };
+
+  // ============================================================
+  // SECTION 2: TELEGRAM INTEGRATION
+  // ============================================================
+  const TG = {
+    wa: null,
+    ok: false,
+    init() {
+      try {
+        if (window.Telegram && window.Telegram.WebApp) {
+          this.wa = window.Telegram.WebApp;
+          this.ok = true;
+          this.wa.ready();
+          this.wa.expand();
+          if (this.wa.requestFullscreen) this.wa.requestFullscreen();
+          if (this.wa.disableVerticalSwipes) this.wa.disableVerticalSwipes();
+        }
+      } catch (e) { this.ok = false; }
+    },
+    haptic(type, val) {
+      if (!this.ok || !this.wa.HapticFeedback) return;
+      try {
+        if (type === 'impact') this.wa.HapticFeedback.impactOccurred(val || 'medium');
+        else if (type === 'notify') this.wa.HapticFeedback.notificationOccurred(val || 'success');
+        else if (type === 'select') this.wa.HapticFeedback.selectionChanged();
+      } catch (e) {}
+    }
+  };
+
+  // ============================================================
+  // SECTION 3: INPUT MANAGER
+  // ============================================================
+  const Input = {
+    p1: { left: false, right: false, jump: false, grab: false },
+    p2: { left: false, right: false, jump: false, grab: false },
+    keys: {},
+    isMobile: false,
+    touch: {
+      joy: { active: false, id: null, cx: 0, cy: 0, dx: 0, dy: 0, r: 65 },
+      btnJump: { active: false, id: null },
+      btnGrab: { active: false, id: null },
+    },
+    canvas: null,
+
+    init(canvas) {
+      this.canvas = canvas;
+      this.isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+      window.addEventListener('keydown', e => { this.keys[e.code] = true; e.preventDefault(); });
+      window.addEventListener('keyup', e => { this.keys[e.code] = false; });
+      canvas.addEventListener('touchstart', e => this.onTouchStart(e), { passive: false });
+      canvas.addEventListener('touchmove', e => this.onTouchMove(e), { passive: false });
+      canvas.addEventListener('touchend', e => this.onTouchEnd(e), { passive: false });
+      canvas.addEventListener('touchcancel', e => this.onTouchEnd(e), { passive: false });
+      document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+    },
+
+    // Convert screen coords to canvas-relative coords
+    screenToCanvas(tx, ty) {
+      const r = this.canvas.getBoundingClientRect();
+      return { x: tx - r.left, y: ty - r.top };
+    },
+
+    getJumpBtnRect() {
+      const cw = this.canvas.clientWidth;
+      const ch = this.canvas.clientHeight;
+      const sz = Math.min(cw, ch) * 0.13;
+      return { x: cw - sz * 1.5, y: ch - sz * 2.8, r: sz * 0.48 };
+    },
+
+    getGrabBtnRect() {
+      const cw = this.canvas.clientWidth;
+      const ch = this.canvas.clientHeight;
+      const sz = Math.min(cw, ch) * 0.13;
+      return { x: cw - sz * 1.5, y: ch - sz * 1.2, r: sz * 0.42 };
+    },
+
+    isInCircle(px, py, cx, cy, cr) {
+      const dx = px - cx, dy = py - cy;
+      return dx * dx + dy * dy <= cr * cr;
+    },
+
+    onTouchStart(e) {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        const p = this.screenToCanvas(t.clientX, t.clientY);
+        const jb = this.getJumpBtnRect();
+        const gb = this.getGrabBtnRect();
+        if (this.isInCircle(p.x, p.y, jb.x, jb.y, jb.r * 1.5)) {
+          this.touch.btnJump = { active: true, id: t.identifier };
+        } else if (this.isInCircle(p.x, p.y, gb.x, gb.y, gb.r * 1.5)) {
+          this.touch.btnGrab = { active: true, id: t.identifier };
+        } else if (p.x < this.canvas.clientWidth * 0.5) {
+          this.touch.joy = { active: true, id: t.identifier, cx: p.x, cy: p.y, dx: 0, dy: 0, r: this.touch.joy.r };
+        }
+      }
+    },
+
+    onTouchMove(e) {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        if (this.touch.joy.active && t.identifier === this.touch.joy.id) {
+          const p = this.screenToCanvas(t.clientX, t.clientY);
+          this.touch.joy.dx = p.x - this.touch.joy.cx;
+          this.touch.joy.dy = p.y - this.touch.joy.cy;
+        }
+      }
+    },
+
+    onTouchEnd(e) {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        if (this.touch.joy.active && t.identifier === this.touch.joy.id) {
+          this.touch.joy.active = false;
+          this.touch.joy.dx = 0;
+          this.touch.joy.dy = 0;
+        }
+        if (this.touch.btnJump.active && t.identifier === this.touch.btnJump.id) {
+          this.touch.btnJump.active = false;
+        }
+        if (this.touch.btnGrab.active && t.identifier === this.touch.btnGrab.id) {
+          this.touch.btnGrab.active = false;
+        }
+      }
+    },
+
+    update() {
+      // Player 1 - keyboard
+      this.p1.left = !!this.keys['ArrowLeft'];
+      this.p1.right = !!this.keys['ArrowRight'];
+      this.p1.jump = !!this.keys['ArrowUp'];
+      this.p1.grab = !!this.keys['ArrowDown'];
+
+      // Player 1 - touch overlay
+      if (this.isMobile) {
+        const j = this.touch.joy;
+        if (j.active) {
+          const mag = Math.sqrt(j.dx * j.dx + j.dy * j.dy);
+          if (mag > 18) {
+            const nx = j.dx / mag, ny = j.dy / mag;
+            this.p1.left = nx < -0.35;
+            this.p1.right = nx > 0.35;
+            if (ny < -0.5) this.p1.jump = true;
+          }
+        }
+        if (this.touch.btnJump.active) this.p1.jump = true;
+        if (this.touch.btnGrab.active) this.p1.grab = true;
+      }
+
+      // Player 2 - keyboard (WASD)
+      this.p2.left = !!this.keys['KeyA'];
+      this.p2.right = !!this.keys['KeyD'];
+      this.p2.jump = !!this.keys['KeyW'];
+      this.p2.grab = !!this.keys['KeyS'];
+    },
+
+    renderTouchControls(ctx, cw, ch) {
+      if (!this.isMobile) return;
+      ctx.save();
+
+      // Joystick
+      const j = this.touch.joy;
+      if (j.active) {
+        // Base
+        ctx.beginPath();
+        ctx.arc(j.cx, j.cy, j.r, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.1)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // Thumb
+        const mag = Math.sqrt(j.dx * j.dx + j.dy * j.dy);
+        const clamp = Math.min(mag, j.r);
+        const tx = mag > 0 ? j.cx + (j.dx / mag) * clamp : j.cx;
+        const ty = mag > 0 ? j.cy + (j.dy / mag) * clamp : j.cy;
+        ctx.beginPath();
+        ctx.arc(tx, ty, 22, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.35)';
+        ctx.fill();
+      } else {
+        // Hint circle
+        const hx = cw * 0.15, hy = ch * 0.65;
+        ctx.beginPath();
+        ctx.arc(hx, hy, j.r, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 8]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(255,255,255,0.15)';
+        ctx.font = '14px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('MOVE', hx, hy + 5);
+      }
+
+      // Jump button
+      const jb = this.getJumpBtnRect();
+      ctx.beginPath();
+      ctx.arc(jb.x, jb.y, jb.r, 0, Math.PI * 2);
+      ctx.fillStyle = this.touch.btnJump.active ? 'rgba(0,229,255,0.4)' : 'rgba(255,255,255,0.12)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,229,255,0.5)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('JUMP', jb.x, jb.y);
+
+      // Grab button
+      const gb = this.getGrabBtnRect();
+      ctx.beginPath();
+      ctx.arc(gb.x, gb.y, gb.r, 0, Math.PI * 2);
+      ctx.fillStyle = this.touch.btnGrab.active ? 'rgba(255,23,68,0.4)' : 'rgba(255,255,255,0.12)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,23,68,0.5)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText('GRAB', gb.x, gb.y);
+
+      ctx.restore();
+    }
+  };
+
+  // ============================================================
+  // SECTION 4: PHYSICS ENGINE
+  // ============================================================
+  const Physics = {
+    circlesOverlap(x1, y1, r1, x2, y2, r2) {
+      const dx = x2 - x1, dy = y2 - y1;
+      return dx * dx + dy * dy <= (r1 + r2) * (r1 + r2);
+    },
+
+    ballTouchesSlime(ball, slime) {
+      if (!this.circlesOverlap(ball.x, ball.y, ball.radius, slime.x, slime.y, slime.radius)) return false;
+      return ball.y <= slime.y + ball.radius * 0.3;
+    },
+
+    resolveBallSlime(ball, slime) {
+      const dx = ball.x - slime.x;
+      const dy = ball.y - slime.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist === 0) return;
+
+      const nx = dx / dist, ny = dy / dist;
+      const dvx = ball.vx - slime.vx;
+      const dvy = ball.vy - slime.vy;
+      const dvn = dvx * nx + dvy * ny;
+      if (dvn > 0) return;
+
+      const impulse = -(1 + CONFIG.SLIME_BOUNCE) * dvn;
+      ball.vx += impulse * nx + slime.vx * 0.35;
+      ball.vy += impulse * ny + slime.vy * 0.25;
+
+      // Separate
+      const overlap = (ball.radius + slime.radius) - dist;
+      if (overlap > 0) {
+        ball.x += nx * (overlap + 1);
+        ball.y += ny * (overlap + 1);
+      }
+
+      this.clampBallSpeed(ball);
+    },
+
+    clampBallSpeed(ball) {
+      const sp = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+      if (sp > CONFIG.MAX_BALL_SPEED) {
+        ball.vx = (ball.vx / sp) * CONFIG.MAX_BALL_SPEED;
+        ball.vy = (ball.vy / sp) * CONFIG.MAX_BALL_SPEED;
+      }
+    },
+
+    resolveBallWalls(ball, fw, groundY) {
+      // Ground
+      if (ball.y + ball.radius >= groundY) {
+        ball.y = groundY - ball.radius;
+        ball.vy = -Math.abs(ball.vy) * CONFIG.BALL_BOUNCE;
+        ball.vx *= 0.97;
+        if (Math.abs(ball.vy) < 0.5) ball.vy = 0;
+      }
+      // Ceiling
+      if (ball.y - ball.radius <= 0) {
+        ball.y = ball.radius;
+        ball.vy = Math.abs(ball.vy) * CONFIG.BALL_BOUNCE;
+      }
+      // Left wall - only above goal
+      const goalTop = groundY - CONFIG.GOAL_HEIGHT;
+      if (ball.x - ball.radius <= CONFIG.GOAL_DEPTH) {
+        if (ball.y - ball.radius < goalTop) {
+          // Crossbar bounce
+          if (ball.x - ball.radius <= CONFIG.GOAL_DEPTH && ball.y + ball.radius >= goalTop - CONFIG.GOAL_POST_W && ball.y - ball.radius < goalTop) {
+            ball.y = goalTop - CONFIG.GOAL_POST_W - ball.radius;
+            ball.vy = -Math.abs(ball.vy) * CONFIG.BALL_BOUNCE;
+          }
+          if (ball.x - ball.radius < 0) {
+            ball.x = ball.radius;
+            ball.vx = Math.abs(ball.vx) * CONFIG.BALL_BOUNCE;
+          }
+        } else {
+          // In goal area
+          if (ball.x - ball.radius <= 0) {
+            ball.x = ball.radius;
+            ball.vx = Math.abs(ball.vx) * CONFIG.BALL_BOUNCE;
+          }
+          // Post bounce
+          if (ball.x + ball.radius >= CONFIG.GOAL_DEPTH && ball.x - ball.radius < CONFIG.GOAL_DEPTH + CONFIG.GOAL_POST_W) {
+            if (ball.vx > 0) {
+              ball.x = CONFIG.GOAL_DEPTH + CONFIG.GOAL_POST_W + ball.radius;
+              ball.vx = Math.abs(ball.vx) * CONFIG.BALL_BOUNCE;
+            }
+          }
+        }
+      }
+      // Right wall - only above goal
+      const rGoalX = fw - CONFIG.GOAL_DEPTH;
+      if (ball.x + ball.radius >= rGoalX) {
+        if (ball.y - ball.radius < goalTop) {
+          // Crossbar
+          if (ball.x + ball.radius >= rGoalX && ball.y + ball.radius >= goalTop - CONFIG.GOAL_POST_W && ball.y - ball.radius < goalTop) {
+            ball.y = goalTop - CONFIG.GOAL_POST_W - ball.radius;
+            ball.vy = -Math.abs(ball.vy) * CONFIG.BALL_BOUNCE;
+          }
+          if (ball.x + ball.radius > fw) {
+            ball.x = fw - ball.radius;
+            ball.vx = -Math.abs(ball.vx) * CONFIG.BALL_BOUNCE;
+          }
+        } else {
+          // In goal area
+          if (ball.x + ball.radius >= fw) {
+            ball.x = fw - ball.radius;
+            ball.vx = -Math.abs(ball.vx) * CONFIG.BALL_BOUNCE;
+          }
+          // Post
+          if (ball.x - ball.radius <= rGoalX && ball.x + ball.radius > rGoalX - CONFIG.GOAL_POST_W) {
+            if (ball.vx < 0) {
+              ball.x = rGoalX - CONFIG.GOAL_POST_W - ball.radius;
+              ball.vx = -Math.abs(ball.vx) * CONFIG.BALL_BOUNCE;
+            }
+          }
+        }
+      }
+      // Above goal walls
+      if (ball.x - ball.radius < CONFIG.GOAL_DEPTH + CONFIG.GOAL_POST_W && ball.y - ball.radius < goalTop) {
+        if (ball.x - ball.radius < 0) {
+          ball.x = ball.radius;
+          ball.vx = Math.abs(ball.vx) * CONFIG.BALL_BOUNCE;
+        }
+      }
+      if (ball.x + ball.radius > rGoalX - CONFIG.GOAL_POST_W && ball.y - ball.radius < goalTop) {
+        if (ball.x + ball.radius > fw) {
+          ball.x = fw - ball.radius;
+          ball.vx = -Math.abs(ball.vx) * CONFIG.BALL_BOUNCE;
+        }
+      }
+    },
+
+    ballInGoal(ball, side, fw) {
+      const goalTop = CONFIG.GROUND_Y - CONFIG.GOAL_HEIGHT;
+      const inY = ball.y > goalTop && ball.y < CONFIG.GROUND_Y;
+      if (side === 'left') {
+        return ball.x - ball.radius <= CONFIG.GOAL_POST_W && inY;
+      }
+      return ball.x + ball.radius >= fw - CONFIG.GOAL_POST_W && inY;
+    }
+  };
+
+  // ============================================================
+  // SECTION 5: ENTITIES
+  // ============================================================
+  class Slime {
+    constructor(num, x, color) {
+      this.num = num;
+      this.x = x;
+      this.y = CONFIG.GROUND_Y;
+      this.vx = 0;
+      this.vy = 0;
+      this.radius = CONFIG.SLIME_RADIUS;
+      this.color = color;
+      this.score = 0;
+      this.onGround = true;
+      this.grabTimer = 0;
+      this.campTimer = 0;
+      this.campWarn = false;
+    }
+
+    update(input) {
+      if (input.left) this.vx = -CONFIG.SLIME_SPEED;
+      else if (input.right) this.vx = CONFIG.SLIME_SPEED;
+      else this.vx *= (this.onGround ? CONFIG.GROUND_FRICTION : CONFIG.AIR_FRICTION);
+
+      if (input.jump && this.onGround) {
+        this.vy = CONFIG.SLIME_JUMP_VEL;
+        this.onGround = false;
+      }
+
+      this.vy += CONFIG.GRAVITY;
+      this.x += this.vx;
+      this.y += this.vy;
+
+      if (this.y >= CONFIG.GROUND_Y) {
+        this.y = CONFIG.GROUND_Y;
+        this.vy = 0;
+        this.onGround = true;
+      }
+
+      // Keep on field (not inside goals)
+      const goalTop = CONFIG.GROUND_Y - CONFIG.GOAL_HEIGHT;
+      const leftBound = this.y > goalTop ? 0 : CONFIG.GOAL_DEPTH + CONFIG.GOAL_POST_W;
+      const rightBound = this.y > goalTop ? CONFIG.DESIGN_WIDTH : CONFIG.DESIGN_WIDTH - CONFIG.GOAL_DEPTH - CONFIG.GOAL_POST_W;
+      this.x = Math.max(leftBound + this.radius, Math.min(rightBound - this.radius, this.x));
+
+      if (Math.abs(this.vx) < 0.1) this.vx = 0;
+    }
+  }
+
+  class Ball {
+    constructor(x, y) {
+      this.x = x;
+      this.y = y;
+      this.vx = 0;
+      this.vy = 0;
+      this.radius = CONFIG.BALL_RADIUS;
+      this.rot = 0;
+      this.grabbed = false;
+      this.grabbedBy = null;
+      this.grabAngle = Math.PI / 2;
+    }
+
+    update() {
+      if (this.grabbed && this.grabbedBy) {
+        const s = this.grabbedBy;
+        this.x = s.x + Math.cos(this.grabAngle) * (s.radius + this.radius + 2);
+        this.y = s.y - Math.abs(Math.sin(this.grabAngle)) * (s.radius + this.radius + 2);
+        this.vx = 0;
+        this.vy = 0;
+        return;
+      }
+      this.vy += CONFIG.GRAVITY;
+      this.x += this.vx;
+      this.y += this.vy;
+      this.rot += this.vx * 0.06;
+    }
+
+    doThrow() {
+      const speed = CONFIG.GRAB_THROW_SPEED;
+      this.vx = Math.cos(this.grabAngle) * speed;
+      this.vy = -Math.abs(Math.sin(this.grabAngle)) * speed;
+      this.grabbed = false;
+      this.grabbedBy = null;
+    }
+  }
+
+  class Particle {
+    constructor(x, y, color) {
+      this.x = x;
+      this.y = y;
+      this.vx = (Math.random() - 0.5) * 10;
+      this.vy = (Math.random() - 0.5) * 10 - 4;
+      this.life = 1;
+      this.decay = 0.015 + Math.random() * 0.025;
+      this.r = 2 + Math.random() * 5;
+      this.color = color;
+    }
+    update() {
+      this.vy += CONFIG.GRAVITY * 0.25;
+      this.x += this.vx;
+      this.y += this.vy;
+      this.life -= this.decay;
+    }
+    get alive() { return this.life > 0; }
+  }
+
+  // ============================================================
+  // SECTION 6: AI CONTROLLER
+  // ============================================================
+  const AI = {
+    timer: 0,
+    targetX: 0,
+    doJump: false,
+    doGrab: false,
+    throwRelease: false,
+    aimLeft: false,
+    aimRight: false,
+
+    update(slime, ball, opponent, fw) {
+      this.timer++;
+      if (this.timer >= CONFIG.AI_REACT_DELAY) {
+        this.timer = 0;
+        this.think(slime, ball, opponent, fw);
+      }
+
+      const input = { left: false, right: false, jump: false, grab: false };
+      const dx = this.targetX - slime.x;
+
+      if (Math.abs(dx) > 12) {
+        input.left = dx < 0;
+        input.right = dx > 0;
+      }
+
+      input.jump = this.doJump && slime.onGround;
+      input.grab = this.doGrab;
+
+      // Random mistakes
+      if (Math.random() > CONFIG.AI_ACCURACY) {
+        input.left = false;
+        input.right = false;
+      }
+
+      if (this.throwRelease) {
+        input.grab = false;
+        this.throwRelease = false;
+        this.aimLeft = false;
+        this.aimRight = false;
+      }
+
+      // Override left/right for aiming when holding ball
+      if (this.aimLeft) { input.left = true; input.right = false; }
+      if (this.aimRight) { input.right = true; input.left = false; }
+
+      return input;
+    },
+
+    think(slime, ball, opponent, fw) {
+      const mid = fw / 2;
+      const ballOnMySide = ball.x > mid;
+      const ballApproaching = ball.vx > 1;
+
+      if (ball.grabbed && ball.grabbedBy === slime) {
+        // Aim toward opponent goal (left), then release
+        const desiredAngle = Math.PI * 0.7;
+        if (Math.abs(ball.grabAngle - desiredAngle) > 0.2) {
+          // Still aiming
+          this.doGrab = true;
+          this.throwRelease = false;
+          this.aimLeft = ball.grabAngle < desiredAngle;
+          this.aimRight = ball.grabAngle > desiredAngle;
+        } else {
+          this.doGrab = false;
+          this.throwRelease = true;
+          this.aimLeft = false;
+          this.aimRight = false;
+        }
+        this.targetX = slime.x;
+        return;
+      }
+
+      if (ballOnMySide || (ballApproaching && ball.x > mid * 0.5)) {
+        // Intercept ball
+        const predX = ball.x + ball.vx * 8;
+        this.targetX = Math.max(mid, Math.min(fw - slime.radius - 10, predX));
+
+        const dist = Math.sqrt((ball.x - slime.x) ** 2 + (ball.y - slime.y) ** 2);
+        const totalR = slime.radius + ball.radius + CONFIG.GRAB_RANGE;
+
+        // Jump if ball is above
+        const predY = ball.y + ball.vy * 6;
+        this.doJump = predY < slime.y - CONFIG.AI_JUMP_THRESH && dist < 200;
+
+        // Grab if close
+        this.doGrab = dist < totalR + 30 && ball.y < slime.y;
+      } else {
+        // Defensive position
+        this.targetX = fw * 0.73;
+        this.doJump = false;
+        this.doGrab = false;
+      }
+    }
+  };
+
+  // ============================================================
+  // SECTION 7: ANTI-CAMPING
+  // ============================================================
+  const Camping = {
+    update(slime, fw) {
+      const inZone = slime.num === 1
+        ? slime.x - slime.radius < CONFIG.CAMP_ZONE_W
+        : slime.x + slime.radius > fw - CONFIG.CAMP_ZONE_W;
+
+      if (inZone) {
+        slime.campTimer++;
+        slime.campWarn = slime.campTimer >= CONFIG.CAMP_WARN_FRAMES;
+        if (slime.campTimer >= CONFIG.CAMP_PENALTY_FRAMES) {
+          slime.campTimer = 0;
+          slime.campWarn = false;
+          return true;
+        }
+      } else {
+        slime.campTimer = Math.max(0, slime.campTimer - 2);
+        slime.campWarn = false;
+      }
+      return false;
+    }
+  };
+
+  // ============================================================
+  // SECTION 8: RENDERER
+  // ============================================================
+  const Render = {
+    canvas: null,
+    ctx: null,
+    scale: 1,
+    ox: 0,
+    oy: 0,
+    shake: { x: 0, y: 0, int: 0 },
+
+    init(canvas) {
+      this.canvas = canvas;
+      this.ctx = canvas.getContext('2d');
+      this.resize();
+    },
+
+    resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      this.canvas.width = window.innerWidth * dpr;
+      this.canvas.height = window.innerHeight * dpr;
+      this.scale = Math.min(this.canvas.width / CONFIG.DESIGN_WIDTH, this.canvas.height / CONFIG.DESIGN_HEIGHT);
+      this.ox = (this.canvas.width - CONFIG.DESIGN_WIDTH * this.scale) / 2;
+      this.oy = (this.canvas.height - CONFIG.DESIGN_HEIGHT * this.scale) / 2;
+    },
+
+    begin() {
+      const c = this.ctx;
+      c.save();
+      c.fillStyle = '#000';
+      c.fillRect(0, 0, this.canvas.width, this.canvas.height);
+      c.translate(this.ox + this.shake.x, this.oy + this.shake.y);
+      c.scale(this.scale, this.scale);
+    },
+
+    end() {
+      this.ctx.restore();
+      this.shake.int *= 0.88;
+      if (this.shake.int < 0.5) { this.shake.x = 0; this.shake.y = 0; }
+      else {
+        this.shake.x = (Math.random() - 0.5) * this.shake.int;
+        this.shake.y = (Math.random() - 0.5) * this.shake.int;
+      }
+    },
+
+    doShake(i) { this.shake.int = i; },
+
+    drawBG() {
+      const c = this.ctx;
+      const g = c.createLinearGradient(0, 0, 0, CONFIG.GROUND_Y);
+      g.addColorStop(0, CONFIG.COL_SKY_TOP);
+      g.addColorStop(1, CONFIG.COL_SKY_BOT);
+      c.fillStyle = g;
+      c.fillRect(0, 0, CONFIG.DESIGN_WIDTH, CONFIG.GROUND_Y);
+
+      c.fillStyle = CONFIG.COL_GROUND;
+      c.fillRect(0, CONFIG.GROUND_Y, CONFIG.DESIGN_WIDTH, CONFIG.DESIGN_HEIGHT - CONFIG.GROUND_Y);
+
+      c.strokeStyle = CONFIG.COL_GROUND_LINE;
+      c.lineWidth = 3;
+      c.beginPath();
+      c.moveTo(0, CONFIG.GROUND_Y);
+      c.lineTo(CONFIG.DESIGN_WIDTH, CONFIG.GROUND_Y);
+      c.stroke();
+
+      // Center line
+      c.strokeStyle = 'rgba(255,255,255,0.1)';
+      c.lineWidth = 2;
+      c.setLineDash([10, 10]);
+      c.beginPath();
+      c.moveTo(CONFIG.DESIGN_WIDTH / 2, 0);
+      c.lineTo(CONFIG.DESIGN_WIDTH / 2, CONFIG.GROUND_Y);
+      c.stroke();
+      c.setLineDash([]);
+    },
+
+    drawGoals() {
+      const c = this.ctx;
+      const fw = CONFIG.DESIGN_WIDTH;
+      const gy = CONFIG.GROUND_Y;
+      const gh = CONFIG.GOAL_HEIGHT;
+      const gd = CONFIG.GOAL_DEPTH;
+      const pw = CONFIG.GOAL_POST_W;
+      const goalTop = gy - gh;
+
+      // Left goal
+      // Net
+      c.strokeStyle = CONFIG.COL_NET;
+      c.lineWidth = 1;
+      for (let y = goalTop; y <= gy; y += CONFIG.NET_SPACING) {
+        c.beginPath(); c.moveTo(0, y); c.lineTo(gd, y); c.stroke();
+      }
+      for (let x = 0; x <= gd; x += CONFIG.NET_SPACING) {
+        c.beginPath(); c.moveTo(x, goalTop); c.lineTo(x, gy); c.stroke();
+      }
+      // Post
+      c.fillStyle = CONFIG.COL_POST;
+      c.fillRect(gd, goalTop - pw, pw, gh + pw);
+      // Crossbar
+      c.fillRect(0, goalTop - pw, gd + pw, pw);
+
+      // Right goal
+      const rx = fw - gd;
+      c.strokeStyle = CONFIG.COL_NET;
+      for (let y = goalTop; y <= gy; y += CONFIG.NET_SPACING) {
+        c.beginPath(); c.moveTo(rx, y); c.lineTo(fw, y); c.stroke();
+      }
+      for (let x = rx; x <= fw; x += CONFIG.NET_SPACING) {
+        c.beginPath(); c.moveTo(x, goalTop); c.lineTo(x, gy); c.stroke();
+      }
+      c.fillStyle = CONFIG.COL_POST;
+      c.fillRect(rx - pw, goalTop - pw, pw, gh + pw);
+      c.fillRect(rx - pw, goalTop - pw, gd + pw, pw);
+    },
+
+    drawSlime(slime) {
+      const c = this.ctx;
+      c.save();
+
+      // Camping flash
+      let col = slime.color;
+      if (slime.campWarn && Math.floor(Date.now() / 120) % 2 === 0) col = CONFIG.COL_WARN;
+
+      // Shadow
+      c.fillStyle = 'rgba(0,0,0,0.15)';
+      c.beginPath();
+      c.ellipse(slime.x, CONFIG.GROUND_Y + 3, slime.radius * 0.85, 6, 0, 0, Math.PI * 2);
+      c.fill();
+
+      // Body semicircle
+      c.fillStyle = col;
+      c.beginPath();
+      c.arc(slime.x, slime.y, slime.radius, Math.PI, 0);
+      c.closePath();
+      c.fill();
+
+      // Highlight
+      c.fillStyle = 'rgba(255,255,255,0.15)';
+      c.beginPath();
+      c.arc(slime.x - slime.radius * 0.2, slime.y - slime.radius * 0.4, slime.radius * 0.35, 0, Math.PI * 2);
+      c.fill();
+
+      // Eye
+      const eyeDir = slime.num === 1 ? 1 : -1;
+      const ex = slime.x + slime.radius * 0.3 * eyeDir;
+      const ey = slime.y - slime.radius * 0.5;
+      c.fillStyle = '#fff';
+      c.beginPath();
+      c.arc(ex, ey, 7, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = '#111';
+      c.beginPath();
+      c.arc(ex + 2 * eyeDir, ey + 1, 3.5, 0, Math.PI * 2);
+      c.fill();
+
+      c.restore();
+    },
+
+    drawBall(ball) {
+      const c = this.ctx;
+      c.save();
+
+      // Shadow
+      c.fillStyle = 'rgba(0,0,0,0.12)';
+      c.beginPath();
+      c.ellipse(ball.x, CONFIG.GROUND_Y + 3, ball.radius * 0.7, 4, 0, 0, Math.PI * 2);
+      c.fill();
+
+      c.translate(ball.x, ball.y);
+      c.rotate(ball.rot);
+
+      // Ball body
+      c.fillStyle = CONFIG.COL_BALL;
+      c.beginPath();
+      c.arc(0, 0, ball.radius, 0, Math.PI * 2);
+      c.fill();
+
+      // Cross lines for rotation visibility
+      c.strokeStyle = CONFIG.COL_BALL_LINE;
+      c.lineWidth = 2;
+      c.beginPath();
+      c.moveTo(-ball.radius * 0.7, 0);
+      c.lineTo(ball.radius * 0.7, 0);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(0, -ball.radius * 0.7);
+      c.lineTo(0, ball.radius * 0.7);
+      c.stroke();
+
+      // Highlight
+      c.fillStyle = 'rgba(255,255,255,0.3)';
+      c.beginPath();
+      c.arc(-ball.radius * 0.25, -ball.radius * 0.25, ball.radius * 0.3, 0, Math.PI * 2);
+      c.fill();
+
+      c.restore();
+    },
+
+    drawGrabIndicator(ball) {
+      if (!ball.grabbed || !ball.grabbedBy) return;
+      const c = this.ctx;
+      const s = ball.grabbedBy;
+      const angle = ball.grabAngle;
+      const len = 35;
+      const ax = ball.x + Math.cos(angle) * len;
+      const ay = ball.y - Math.abs(Math.sin(angle)) * len;
+
+      c.save();
+      c.strokeStyle = 'rgba(255,255,255,0.5)';
+      c.lineWidth = 2;
+      c.setLineDash([4, 4]);
+      c.beginPath();
+      c.moveTo(ball.x, ball.y);
+      c.lineTo(ax, ay);
+      c.stroke();
+      c.setLineDash([]);
+
+      // Arrow head
+      c.fillStyle = 'rgba(255,255,255,0.6)';
+      c.beginPath();
+      c.arc(ax, ay, 4, 0, Math.PI * 2);
+      c.fill();
+      c.restore();
+    },
+
+    drawHUD(s1, s2, timeLeft) {
+      const c = this.ctx;
+      const fw = CONFIG.DESIGN_WIDTH;
+
+      // Score background
+      c.fillStyle = 'rgba(0,0,0,0.3)';
+      const sw = 200, sh = 55;
+      c.beginPath();
+      c.roundRect(fw / 2 - sw / 2, 8, sw, sh, 10);
+      c.fill();
+
+      // Scores
+      c.font = 'bold 32px monospace';
+      c.textAlign = 'center';
+      c.textBaseline = 'top';
+      c.fillStyle = CONFIG.COL_P1;
+      c.fillText(String(s1.score), fw / 2 - 40, 14);
+      c.fillStyle = CONFIG.COL_TEXT;
+      c.fillText('-', fw / 2, 14);
+      c.fillStyle = CONFIG.COL_P2;
+      c.fillText(String(s2.score), fw / 2 + 40, 14);
+
+      // Timer
+      const sec = Math.max(0, Math.ceil(timeLeft / 60));
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      c.font = '16px monospace';
+      c.fillStyle = sec <= 10 ? '#ff5252' : 'rgba(255,255,255,0.7)';
+      c.fillText(m + ':' + String(s).padStart(2, '0'), fw / 2, 46);
+    },
+
+    drawParticles(particles) {
+      const c = this.ctx;
+      for (const p of particles) {
+        c.globalAlpha = Math.max(0, p.life);
+        c.fillStyle = p.color;
+        c.beginPath();
+        c.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
+        c.fill();
+      }
+      c.globalAlpha = 1;
+    },
+
+    drawGoalText(scorer, timer) {
+      const c = this.ctx;
+      const alpha = Math.min(1, timer / 30);
+      const scale = 1 + (1 - timer / CONFIG.CELEBRATION_FRAMES) * 0.5;
+      c.save();
+      c.translate(CONFIG.DESIGN_WIDTH / 2, CONFIG.DESIGN_HEIGHT * 0.35);
+      c.scale(scale, scale);
+      c.globalAlpha = alpha;
+      c.font = 'bold 64px monospace';
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+      c.fillStyle = scorer === 1 ? CONFIG.COL_P1 : CONFIG.COL_P2;
+      c.fillText('GOAL!', 0, 0);
+      c.restore();
+    },
+
+    drawGameOver(s1, s2) {
+      const c = this.ctx;
+      const fw = CONFIG.DESIGN_WIDTH;
+      const fh = CONFIG.DESIGN_HEIGHT;
+
+      c.fillStyle = 'rgba(0,0,0,0.6)';
+      c.fillRect(0, 0, fw, fh);
+
+      c.font = 'bold 48px monospace';
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+
+      let text, color;
+      if (s1.score > s2.score) { text = 'PLAYER 1 WINS!'; color = CONFIG.COL_P1; }
+      else if (s2.score > s1.score) { text = 'PLAYER 2 WINS!'; color = CONFIG.COL_P2; }
+      else { text = 'DRAW!'; color = CONFIG.COL_TEXT; }
+
+      c.fillStyle = color;
+      c.fillText(text, fw / 2, fh * 0.35);
+
+      c.font = 'bold 72px monospace';
+      c.fillStyle = CONFIG.COL_P1;
+      c.fillText(String(s1.score), fw / 2 - 60, fh * 0.5);
+      c.fillStyle = CONFIG.COL_TEXT;
+      c.fillText('-', fw / 2, fh * 0.5);
+      c.fillStyle = CONFIG.COL_P2;
+      c.fillText(String(s2.score), fw / 2 + 60, fh * 0.5);
+
+      c.font = '20px monospace';
+      c.fillStyle = 'rgba(255,255,255,0.6)';
+      c.fillText('Tap or press Enter to continue', fw / 2, fh * 0.7);
+    }
+  };
+
+  // ============================================================
+  // SECTION 9: MENU SYSTEM
+  // ============================================================
+  const Menu = {
+    state: 'title', // title, mode, duration
+    selectedMode: null,
+    selectedDuration: null,
+    buttons: [],
+    animFrame: 0,
+    clickHandler: null,
+
+    init() {
+      this.state = 'title';
+      this.buttons = [];
+    },
+
+    buildButtons() {
+      this.buttons = [];
+      const fw = CONFIG.DESIGN_WIDTH;
+      const fh = CONFIG.DESIGN_HEIGHT;
+
+      if (this.state === 'title') {
+        this.buttons.push({ x: fw / 2 - 100, y: fh * 0.6, w: 200, h: 50, label: 'PLAY', value: 'play' });
+      } else if (this.state === 'mode') {
+        this.buttons.push({ x: fw / 2 - 130, y: fh * 0.4, w: 260, h: 55, label: 'VS COMPUTER', value: 'ai' });
+        this.buttons.push({ x: fw / 2 - 130, y: fh * 0.58, w: 260, h: 55, label: 'LOCAL 2 PLAYER', value: 'local' });
+      } else if (this.state === 'duration') {
+        const durations = CONFIG.DURATIONS;
+        const bw = 70, bh = 50, gap = 15;
+        const totalW = durations.length * bw + (durations.length - 1) * gap;
+        const startX = fw / 2 - totalW / 2;
+        for (let i = 0; i < durations.length; i++) {
+          const sel = this.selectedDuration === durations[i];
+          this.buttons.push({
+            x: startX + i * (bw + gap),
+            y: fh * 0.45,
+            w: bw,
+            h: bh,
+            label: durations[i] + 'm',
+            value: 'dur_' + durations[i],
+            selected: sel
+          });
+        }
+        this.buttons.push({ x: fw / 2 - 80, y: fh * 0.65, w: 160, h: 50, label: 'START!', value: 'start' });
+      }
+    },
+
+    handleClick(designX, designY) {
+      for (const b of this.buttons) {
+        if (designX >= b.x && designX <= b.x + b.w && designY >= b.y && designY <= b.y + b.h) {
+          TG.haptic('select');
+          this.onButton(b.value);
+          return true;
+        }
+      }
+      // Title: tap anywhere
+      if (this.state === 'title') {
+        TG.haptic('select');
+        this.onButton('play');
+        return true;
+      }
+      return false;
+    },
+
+    onButton(val) {
+      if (val === 'play') {
+        this.state = 'mode';
+      } else if (val === 'ai' || val === 'local') {
+        this.selectedMode = val;
+        this.state = 'duration';
+        this.selectedDuration = 2;
+      } else if (val.startsWith('dur_')) {
+        this.selectedDuration = parseInt(val.split('_')[1]);
+      } else if (val === 'start') {
+        if (this.selectedDuration && this.clickHandler) {
+          this.clickHandler(this.selectedMode, this.selectedDuration);
+        }
+      }
+      this.buildButtons();
+    },
+
+    render(ctx) {
+      const fw = CONFIG.DESIGN_WIDTH;
+      const fh = CONFIG.DESIGN_HEIGHT;
+      this.animFrame++;
+
+      // Background
+      const g = ctx.createLinearGradient(0, 0, 0, fh);
+      g.addColorStop(0, CONFIG.COL_MENU_BG);
+      g.addColorStop(1, '#1b2838');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, fw, fh);
+
+      // Animated ground
+      ctx.fillStyle = CONFIG.COL_GROUND;
+      ctx.fillRect(0, CONFIG.GROUND_Y, fw, fh - CONFIG.GROUND_Y);
+
+      if (this.state === 'title') {
+        // Title
+        ctx.font = 'bold 56px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        // Shadow
+        ctx.fillStyle = 'rgba(0,0,0,0.3)';
+        ctx.fillText('SLIME SOCCER', fw / 2 + 3, fh * 0.2 + 3);
+
+        ctx.fillStyle = CONFIG.COL_MENU_ACCENT;
+        ctx.fillText('SLIME SOCCER', fw / 2, fh * 0.2);
+
+        // Animated slimes preview
+        const bob = Math.sin(this.animFrame * 0.05) * 5;
+        // P1
+        ctx.fillStyle = CONFIG.COL_P1;
+        ctx.beginPath();
+        ctx.arc(fw * 0.35, CONFIG.GROUND_Y + bob, 35, Math.PI, 0);
+        ctx.closePath();
+        ctx.fill();
+        // P2
+        ctx.fillStyle = CONFIG.COL_P2;
+        ctx.beginPath();
+        ctx.arc(fw * 0.65, CONFIG.GROUND_Y - bob, 35, Math.PI, 0);
+        ctx.closePath();
+        ctx.fill();
+        // Ball
+        const ballBob = Math.sin(this.animFrame * 0.07 + 1) * 15;
+        ctx.fillStyle = CONFIG.COL_BALL;
+        ctx.beginPath();
+        ctx.arc(fw / 2, CONFIG.GROUND_Y - 60 + ballBob, 12, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Tap prompt
+        const blink = Math.sin(this.animFrame * 0.06) * 0.3 + 0.7;
+        ctx.globalAlpha = blink;
+        ctx.font = '18px monospace';
+        ctx.fillStyle = CONFIG.COL_TEXT;
+        ctx.fillText('Tap or press Enter to start', fw / 2, fh * 0.8);
+        ctx.globalAlpha = 1;
+
+      } else if (this.state === 'mode') {
+        ctx.font = 'bold 32px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = CONFIG.COL_TEXT;
+        ctx.fillText('SELECT MODE', fw / 2, fh * 0.2);
+
+      } else if (this.state === 'duration') {
+        ctx.font = 'bold 28px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = CONFIG.COL_TEXT;
+        ctx.fillText('MATCH DURATION', fw / 2, fh * 0.2);
+
+        ctx.font = '16px monospace';
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        const modeLabel = this.selectedMode === 'ai' ? 'VS Computer' : 'Local 2 Player';
+        ctx.fillText(modeLabel, fw / 2, fh * 0.32);
+      }
+
+      // Draw buttons
+      this.buildButtons();
+      for (const b of this.buttons) {
+        const isSel = b.selected;
+        ctx.fillStyle = isSel ? CONFIG.COL_MENU_ACCENT : CONFIG.COL_MENU_BTN;
+        ctx.beginPath();
+        ctx.roundRect(b.x, b.y, b.w, b.h, 8);
+        ctx.fill();
+
+        ctx.strokeStyle = isSel ? CONFIG.COL_MENU_ACCENT : 'rgba(255,255,255,0.15)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.roundRect(b.x, b.y, b.w, b.h, 8);
+        ctx.stroke();
+
+        ctx.font = 'bold 18px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = isSel ? '#000' : CONFIG.COL_TEXT;
+        ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2);
+      }
+    }
+  };
+
+  // ============================================================
+  // SECTION 10: GAME STATE MACHINE
+  // ============================================================
+  const Game = {
+    state: 'MENU', // MENU, PLAYING, GOAL_SCORED, GAME_OVER
+    mode: 'ai',
+    s1: null,
+    s2: null,
+    ball: null,
+    particles: [],
+    timeLeft: 0,
+    celebTimer: 0,
+    lastScorer: 0,
+    gameOverTimer: 0,
+
+    init() {
+      this.state = 'MENU';
+      Menu.init();
+      Menu.clickHandler = (mode, dur) => this.startMatch(mode, dur);
+    },
+
+    startMatch(mode, durMin) {
+      this.mode = mode;
+      this.timeLeft = durMin * 60 * 60;
+      this.s1 = new Slime(1, CONFIG.DESIGN_WIDTH * 0.25, CONFIG.COL_P1);
+      this.s2 = new Slime(2, CONFIG.DESIGN_WIDTH * 0.75, CONFIG.COL_P2);
+      this.resetBall(0);
+      this.particles = [];
+      this.state = 'PLAYING';
+      TG.haptic('notify', 'success');
+    },
+
+    resetBall(lastScorer) {
+      const fw = CONFIG.DESIGN_WIDTH;
+      this.ball = new Ball(fw / 2, CONFIG.DESIGN_HEIGHT * 0.3);
+      this.ball.vx = (Math.random() - 0.5) * 3;
+      this.ball.vy = -1;
+      if (lastScorer === 1) this.ball.x = fw * 0.65;
+      else if (lastScorer === 2) this.ball.x = fw * 0.35;
+    },
+
+    resetPositions(scorer) {
+      this.s1.x = CONFIG.DESIGN_WIDTH * 0.25;
+      this.s1.y = CONFIG.GROUND_Y;
+      this.s1.vx = 0;
+      this.s1.vy = 0;
+      this.s1.onGround = true;
+
+      this.s2.x = CONFIG.DESIGN_WIDTH * 0.75;
+      this.s2.y = CONFIG.GROUND_Y;
+      this.s2.vx = 0;
+      this.s2.vy = 0;
+      this.s2.onGround = true;
+
+      this.resetBall(scorer);
+    },
+
+    goalScored(scorer) {
+      if (scorer === 1) this.s1.score++;
+      else this.s2.score++;
+      this.lastScorer = scorer;
+      this.celebTimer = CONFIG.CELEBRATION_FRAMES;
+      this.state = 'GOAL_SCORED';
+      TG.haptic('notify', 'success');
+      Render.doShake(18);
+
+      const gx = scorer === 1 ? CONFIG.GOAL_DEPTH : CONFIG.DESIGN_WIDTH - CONFIG.GOAL_DEPTH;
+      const gy = CONFIG.GROUND_Y - CONFIG.GOAL_HEIGHT / 2;
+      const col = scorer === 1 ? CONFIG.COL_P1 : CONFIG.COL_P2;
+      for (let i = 0; i < CONFIG.GOAL_PARTICLES; i++) {
+        this.particles.push(new Particle(gx, gy, col));
+      }
+    },
+
+    update() {
+      switch (this.state) {
+        case 'MENU': break;
+        case 'PLAYING': this.updatePlaying(); break;
+        case 'GOAL_SCORED':
+          this.celebTimer--;
+          this.updateParticles();
+          if (this.celebTimer <= 0) {
+            this.resetPositions(this.lastScorer);
+            this.state = 'PLAYING';
+          }
+          break;
+        case 'GAME_OVER':
+          this.gameOverTimer++;
+          this.updateParticles();
+          break;
+      }
+    },
+
+    updatePlaying() {
+      const fw = CONFIG.DESIGN_WIDTH;
+
+      // Input
+      const p1In = Input.p1;
+      let p2In;
+      if (this.mode === 'ai') {
+        p2In = AI.update(this.s2, this.ball, this.s1, fw);
+      } else {
+        p2In = Input.p2;
+      }
+
+      // Update slimes
+      this.s1.update(p1In);
+      this.s2.update(p2In);
+
+      // Slime-slime collision (prevent overlap)
+      this.resolveSlimeSlime();
+
+      // Grab
+      this.handleGrab(this.s1, p1In);
+      this.handleGrab(this.s2, p2In);
+
+      // Ball
+      this.ball.update();
+
+      // Ball-slime collisions
+      if (!this.ball.grabbed) {
+        if (Physics.ballTouchesSlime(this.ball, this.s1)) {
+          Physics.resolveBallSlime(this.ball, this.s1);
+          TG.haptic('impact', 'light');
+          this.spawnHitFX(this.ball.x, this.ball.y, CONFIG.COL_P1);
+        }
+        if (Physics.ballTouchesSlime(this.ball, this.s2)) {
+          Physics.resolveBallSlime(this.ball, this.s2);
+          TG.haptic('impact', 'light');
+          this.spawnHitFX(this.ball.x, this.ball.y, CONFIG.COL_P2);
+        }
+
+        // Ball-walls
+        Physics.resolveBallWalls(this.ball, fw, CONFIG.GROUND_Y);
+
+        // Goal check
+        if (Physics.ballInGoal(this.ball, 'left', fw)) {
+          this.goalScored(2);
+          return;
+        }
+        if (Physics.ballInGoal(this.ball, 'right', fw)) {
+          this.goalScored(1);
+          return;
+        }
+      }
+
+      // Anti-camping
+      if (Camping.update(this.s1, fw)) this.goalScored(2);
+      if (Camping.update(this.s2, fw)) this.goalScored(1);
+
+      // Timer
+      this.timeLeft--;
+      if (this.timeLeft <= 0) {
+        this.state = 'GAME_OVER';
+        this.gameOverTimer = 0;
+        TG.haptic('notify', this.s1.score > this.s2.score ? 'success' : 'error');
+      }
+
+      this.updateParticles();
+    },
+
+    resolveSlimeSlime() {
+      const s1 = this.s1, s2 = this.s2;
+      const dx = s2.x - s1.x;
+      const dy = s2.y - s1.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const minDist = s1.radius + s2.radius;
+      if (dist < minDist && dist > 0) {
+        const overlap = minDist - dist;
+        const nx = dx / dist, ny = dy / dist;
+        s1.x -= nx * overlap * 0.5;
+        s2.x += nx * overlap * 0.5;
+      }
+    },
+
+    handleGrab(slime, input) {
+      const ball = this.ball;
+
+      if (input.grab && !ball.grabbed) {
+        const dx = ball.x - slime.x;
+        const dy = ball.y - slime.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const totalR = slime.radius + ball.radius + CONFIG.GRAB_RANGE;
+        if (dist <= totalR && ball.y <= slime.y) {
+          ball.grabbed = true;
+          ball.grabbedBy = slime;
+          ball.grabAngle = Math.atan2(-(ball.y - slime.y), ball.x - slime.x);
+          if (ball.grabAngle < 0.15) ball.grabAngle = 0.15;
+          if (ball.grabAngle > Math.PI - 0.15) ball.grabAngle = Math.PI - 0.15;
+          slime.grabTimer = 0;
+          TG.haptic('impact', 'medium');
+        }
+      }
+
+      if (ball.grabbed && ball.grabbedBy === slime) {
+        slime.grabTimer++;
+
+        // Aim
+        if (input.left) ball.grabAngle = Math.min(Math.PI - 0.15, ball.grabAngle + 0.04);
+        if (input.right) ball.grabAngle = Math.max(0.15, ball.grabAngle - 0.04);
+
+        // Release
+        if (!input.grab || slime.grabTimer >= CONFIG.GRAB_MAX_HOLD) {
+          ball.doThrow();
+          slime.grabTimer = 0;
+          TG.haptic('impact', 'heavy');
+        }
+      }
+    },
+
+    spawnHitFX(x, y, color) {
+      for (let i = 0; i < CONFIG.HIT_PARTICLES; i++) {
+        this.particles.push(new Particle(x, y, color));
+      }
+    },
+
+    updateParticles() {
+      for (let i = this.particles.length - 1; i >= 0; i--) {
+        this.particles[i].update();
+        if (!this.particles[i].alive) this.particles.splice(i, 1);
+      }
+    },
+
+    // Handle click in design coordinates
+    handleDesignClick(dx, dy) {
+      if (this.state === 'MENU') {
+        Menu.handleClick(dx, dy);
+      } else if (this.state === 'GAME_OVER' && this.gameOverTimer > 30) {
+        this.state = 'MENU';
+        Menu.init();
+      }
+    }
+  };
+
+  // ============================================================
+  // SECTION 11: MAIN GAME LOOP
+  // ============================================================
+  const Loop = {
+    lastTime: 0,
+    accum: 0,
+    dt: 1000 / 60,
+
+    start() {
+      this.lastTime = performance.now();
+      requestAnimationFrame(t => this.tick(t));
+    },
+
+    tick(now) {
+      const elapsed = now - this.lastTime;
+      this.lastTime = now;
+      this.accum += Math.min(elapsed, 100);
+
+      while (this.accum >= this.dt) {
+        Input.update();
+        Game.update();
+        this.accum -= this.dt;
+      }
+
+      this.render();
+      requestAnimationFrame(t => this.tick(t));
+    },
+
+    render() {
+      Render.begin();
+
+      switch (Game.state) {
+        case 'MENU':
+          Menu.render(Render.ctx);
+          break;
+
+        case 'PLAYING':
+        case 'GOAL_SCORED':
+          Render.drawBG();
+          Render.drawGoals();
+          Render.drawSlime(Game.s1);
+          Render.drawSlime(Game.s2);
+          Render.drawBall(Game.ball);
+          Render.drawGrabIndicator(Game.ball);
+          Render.drawParticles(Game.particles);
+          Render.drawHUD(Game.s1, Game.s2, Game.timeLeft);
+          if (Game.state === 'GOAL_SCORED') {
+            Render.drawGoalText(Game.lastScorer, Game.celebTimer);
+          }
+          break;
+
+        case 'GAME_OVER':
+          Render.drawBG();
+          Render.drawGoals();
+          Render.drawSlime(Game.s1);
+          Render.drawSlime(Game.s2);
+          Render.drawBall(Game.ball);
+          Render.drawParticles(Game.particles);
+          Render.drawHUD(Game.s1, Game.s2, 0);
+          Render.drawGameOver(Game.s1, Game.s2);
+          break;
+      }
+
+      Render.end();
+
+      // Touch controls on top (screen space)
+      if (Input.isMobile && (Game.state === 'PLAYING' || Game.state === 'GOAL_SCORED')) {
+        const c = Render.ctx;
+        c.save();
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        c.scale(dpr, dpr);
+        Input.renderTouchControls(c, window.innerWidth, window.innerHeight);
+        c.restore();
+      }
+    }
+  };
+
+  // ============================================================
+  // SECTION 12: INITIALIZATION
+  // ============================================================
+  (function bootstrap() {
+    TG.init();
+
+    const canvas = document.getElementById('gameCanvas');
+    Render.init(canvas);
+    Input.init(canvas);
+    Game.init();
+
+    // Click/tap on canvas for menu interaction
+    function handlePointer(e) {
+      const rect = canvas.getBoundingClientRect();
+      let cx, cy;
+      if (e.touches) {
+        cx = e.touches[0].clientX - rect.left;
+        cy = e.touches[0].clientY - rect.top;
+      } else {
+        cx = e.clientX - rect.left;
+        cy = e.clientY - rect.top;
+      }
+      // Convert to design coordinates
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const sx = cx * dpr;
+      const sy = cy * dpr;
+      const designX = (sx - Render.ox) / Render.scale;
+      const designY = (sy - Render.oy) / Render.scale;
+      Game.handleDesignClick(designX, designY);
+    }
+
+    canvas.addEventListener('click', handlePointer);
+    canvas.addEventListener('touchstart', (e) => {
+      if (Game.state === 'MENU' || Game.state === 'GAME_OVER') {
+        handlePointer(e);
+      }
+    }, { passive: true });
+
+    // Keyboard menu navigation
+    window.addEventListener('keydown', (e) => {
+      if (Game.state === 'MENU') {
+        if (e.code === 'Enter' || e.code === 'Space') {
+          if (Menu.state === 'title') Menu.onButton('play');
+          else if (Menu.state === 'duration' && Menu.selectedDuration) Menu.onButton('start');
+        }
+        if (Menu.state === 'mode') {
+          if (e.code === 'Digit1' || e.code === 'Numpad1') Menu.onButton('ai');
+          if (e.code === 'Digit2' || e.code === 'Numpad2') Menu.onButton('local');
+        }
+        if (Menu.state === 'duration') {
+          const durations = CONFIG.DURATIONS;
+          for (let i = 0; i < durations.length; i++) {
+            if (e.code === 'Digit' + (i + 1) || e.code === 'Numpad' + (i + 1)) {
+              Menu.selectedDuration = durations[i];
+              Menu.buildButtons();
+            }
+          }
+        }
+      } else if (Game.state === 'GAME_OVER' && Game.gameOverTimer > 30) {
+        if (e.code === 'Enter' || e.code === 'Space') {
+          Game.state = 'MENU';
+          Menu.init();
+        }
+      }
+    });
+
+    window.addEventListener('resize', () => Render.resize());
+    window.addEventListener('orientationchange', () => setTimeout(() => Render.resize(), 100));
+
+    Loop.start();
+  })();
+
+  </script>
+</body>
+</html>
